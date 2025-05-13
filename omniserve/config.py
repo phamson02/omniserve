@@ -1,5 +1,6 @@
 # original file: https://github.com/vllm-project/vllm/blob/main/vllm/config.py
 # modified by: Haotian Tang and Shang Yang
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
@@ -11,6 +12,12 @@ from omniserve.utils.utils import get_cpu_memory, is_hip
 logger = init_logger(__name__)
 
 _GB = 1 << 30
+
+
+@dataclass
+class PrecisionMap:
+    precision: str
+    sensitive_layers: list[str]
 
 
 class ModelConfig:
@@ -80,7 +87,9 @@ class ModelConfig:
         max_context_len_to_capture: Optional[int] = None,
         kv_quant_granularity: Optional[str] = None,
         chunk_prefill_size: Optional[str] = 4096,
-        multiblock_switch: Optional[int] = 0
+        multiblock_switch: Optional[int] = 0,
+        precision: Optional[str] = None,
+        precision_map: Optional[PrecisionMap] = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -95,18 +104,21 @@ class ModelConfig:
         self.quantization = quantization
         self.enforce_eager = enforce_eager
         self.max_context_len_to_capture = max_context_len_to_capture
-        
+
         self.kv_quant_granularity = kv_quant_granularity
         self.chunk_prefill_size = chunk_prefill_size
         self.multiblock_switch = multiblock_switch
-        
+
+        self.precision = precision
+        self.precision_map = precision_map
+
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=trust_remote_code
         )
         # TODO (kentang-mit@): make it more general. refer to vllm's _get_and_verify_max_len
         self.dtype = self.hf_config.torch_dtype
         self.max_model_len = self.hf_config.max_position_embeddings
-        self.sp_attn_config = None # assign later
+        self.sp_attn_config = None  # assign later
         self._verify_tokenizer_mode()
 
     def _verify_tokenizer_mode(self) -> None:
@@ -209,7 +221,7 @@ class CacheConfig:
         self.cache_dtype = cache_dtype
         self.cache_bits = cache_bits
         self.sliding_window = sliding_window
-        self.sp_attn_config = None # assign later
+        self.sp_attn_config = None  # assign later
         self._verify_args()
         self._verify_cache_dtype()
 

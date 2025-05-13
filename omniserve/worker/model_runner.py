@@ -12,7 +12,7 @@
 # }
 
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import omniserve_backend.fused_attention_fine_grained_dense as fused_attention
 import torch
@@ -34,17 +34,26 @@ from omniserve.modeling.models.llama_w8a8_unpad import (
 from omniserve.modeling.models.llama_w16a16_unpad import (
     LlamaForCausalLM as LlamaForCausalLMW16A16,
 )
+from omniserve.modeling.models.llama_mixed_unpad import (
+    LlamaForCausalLM as LlamaForCausalLMMixed,
+)
 from omniserve.modeling.models.mixtral_w4a8_unpad import (
     MixtralForCausalLM as MixtralForCausalLMW4A8,
 )
 from omniserve.sampling_params import SamplingParams
 from omniserve.sequence import SamplerOutput, SequenceGroupMetadata
 from omniserve.utils.input_metadata import InputMetadata
-from omniserve.utils.utils import STR_DTYPE_TO_TORCH_DTYPE
 from omniserve.worker.cache_engine import CacheEngine
 
-from omniserve.modeling.layers.ctx_attn.ctx_attn_init import init_ctx_sparse_attn, init_sparse_kv_cache
-from omniserve.modeling.layers.ctx_attn.block_table_utils import pad_block_tables, get_layer_block_tables, _make_tensor_with_pad
+from omniserve.modeling.layers.ctx_attn.ctx_attn_init import (
+    init_ctx_sparse_attn,
+    init_sparse_kv_cache,
+)
+from omniserve.modeling.layers.ctx_attn.block_table_utils import (
+    pad_block_tables,
+    get_layer_block_tables,
+    _make_tensor_with_pad,
+)
 
 logger = init_logger(__name__)
 
@@ -103,41 +112,89 @@ class ModelRunner:
         if model_type == "LlamaForCausalLM" or model_type == "MistralForCausalLM":
             if "w4a8" in precision:
                 print(f"[INFO] Using {precision} precision")
-                self.model = (
-                    LlamaForCausalLMW4A8(
-                        self.model_config.hf_config,
-                        self.model_config,
-                        group_size,
-                        SamplingParams(
-                            temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
-                        ),
-                        kv_cache_config=self.kv_cache_config,
-                        quant_path=quant_path,
+                if self.model_config.precision_map is None:
+                    self.model = (
+                        LlamaForCausalLMW4A8(
+                            self.model_config.hf_config,
+                            self.model_config,
+                            group_size,
+                            SamplingParams(
+                                temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
+                            ),
+                            kv_cache_config=self.kv_cache_config,
+                            quant_path=quant_path,
+                        )
+                        .half()
+                        .to(self.device)
                     )
-                    .half()
-                    .to(self.device)
-                )
+                else:
+                    self.model = (
+                        LlamaForCausalLMMixed(
+                            self.model_config.hf_config,
+                            self.model_config,
+                            group_size,
+                            SamplingParams(
+                                temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
+                            ),
+                            kv_cache_config=self.kv_cache_config,
+                            quant_path=quant_path,
+                        )
+                        .half()
+                        .to(self.device)
+                    )
             elif "w8a8" in precision:
                 print(f"[INFO] Using {precision} precision")
-                self.model = (
-                    LlamaForCausalLMW8A8(
-                        self.model_config.hf_config,
-                        self.model_config,
-                        SamplingParams(
-                            temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
-                        ),
-                        kv_cache_config=self.kv_cache_config,
-                        quant_path=quant_path,
+                if self.model_config.precision_map is None:
+                    self.model = (
+                        LlamaForCausalLMW8A8(
+                            self.model_config.hf_config,
+                            self.model_config,
+                            SamplingParams(
+                                temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
+                            ),
+                            kv_cache_config=self.kv_cache_config,
+                            quant_path=quant_path,
+                        )
+                        .half()
+                        .to(self.device)
                     )
-                    .half()
-                    .to(self.device)
-                )
+                else:
+                    self.model = (
+                        LlamaForCausalLMMixed(
+                            self.model_config.hf_config,
+                            self.model_config,
+                            0,
+                            SamplingParams(
+                                temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
+                            ),
+                            kv_cache_config=self.kv_cache_config,
+                            quant_path=quant_path,
+                        )
+                        .half()
+                        .to(self.device)
+                    )
             elif "w16a16" in precision:
                 print(f"[INFO] Using {precision} precision")
                 self.model = (
                     LlamaForCausalLMW16A16(
                         self.model_config.hf_config,
                         self.model_config,
+                        SamplingParams(
+                            temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
+                        ),
+                        kv_cache_config=self.kv_cache_config,
+                        quant_path=quant_path,
+                    )
+                    .half()
+                    .to(self.device)
+                )
+            elif "mixed" in precision:
+                print(f"[INFO] Using {precision} precision")
+                self.model = (
+                    LlamaForCausalLMMixed(
+                        self.model_config.hf_config,
+                        self.model_config,
+                        group_size,
                         SamplingParams(
                             temperature=1.0, top_p=1.0, top_k=1, max_tokens=512
                         ),
@@ -169,7 +226,7 @@ class ModelRunner:
             else:
                 raise ValueError(
                     f"Unsupported model precision: {precision}. Expected w4a8."
-                ) # add by JXGuo: secure the model to be CausalLM
+                )  # add by JXGuo: secure the model to be CausalLM
         else:
             raise ValueError(f"Unsupported model type: {model_type}.")
         self.block_size = None  # Set after initial profiling.
@@ -182,7 +239,7 @@ class ModelRunner:
             model=self.model,
             sp_attn_config=self.model_config.sp_attn_config,
         )
-        
+
         self.max_context_len_to_capture = (
             self.model_config.max_context_len_to_capture
             if self.model_config is not None
@@ -226,8 +283,12 @@ class ModelRunner:
         num_retrieval_cpu_blocks = 10
         num_streaming_cpu_blocks = 10
 
-        manual_num_retrieval_gpu_blocks = os.environ.get("NUM_RETRIEVAL_GPU_PAGE_BLOCKS")
-        manual_num_streaming_gpu_blocks = os.environ.get("NUM_STREAMING_GPU_PAGE_BLOCKS")
+        manual_num_retrieval_gpu_blocks = os.environ.get(
+            "NUM_RETRIEVAL_GPU_PAGE_BLOCKS"
+        )
+        manual_num_streaming_gpu_blocks = os.environ.get(
+            "NUM_STREAMING_GPU_PAGE_BLOCKS"
+        )
         if manual_num_retrieval_gpu_blocks is not None:
             num_retrieval_gpu_blocks = int(manual_num_retrieval_gpu_blocks)
         if manual_num_streaming_gpu_blocks is not None:
@@ -239,7 +300,8 @@ class ModelRunner:
         cache_config.num_streaming_cpu_blocks = num_streaming_cpu_blocks
         logger.info(
             # f"# GPU blocks: {num_gpu_blocks}, " f"# CPU blocks: {num_cpu_blocks}"
-            f"# Retrieval GPU blocks: {num_retrieval_gpu_blocks}, " f"# Streaming GPU blocks: {num_streaming_gpu_blocks}" #f"# Retrieval CPU blocks: {num_retrieval_cpu_blocks}, " f"# Streaming CPU blocks: {num_streaming_cpu_blocks}"
+            f"# Retrieval GPU blocks: {num_retrieval_gpu_blocks}, "
+            f"# Streaming GPU blocks: {num_streaming_gpu_blocks}"  # f"# Retrieval CPU blocks: {num_retrieval_cpu_blocks}, " f"# Streaming CPU blocks: {num_streaming_cpu_blocks}"
         )
         self.cache_engine = CacheEngine(
             cache_config, model_config, parallel_config, kv_cache_config
@@ -262,7 +324,10 @@ class ModelRunner:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         ifb_mode: bool = True,
-    ) -> Tuple[torch.Tensor, InputMetadata,]:
+    ) -> Tuple[
+        torch.Tensor,
+        InputMetadata,
+    ]:
         # print("[in _prepare_prompt]")
         # kentang-mit@: let's assume that prefix is always none
         assert len(seq_group_metadata_list) > 0
@@ -272,8 +337,14 @@ class ModelRunner:
         retrieval_block_tables = []
         streaming_block_tables = []
         kv_scales_ptrs = []
-        sink_size, local_size = self.model_config.sp_attn_config.get_dec_sink_size(), self.model_config.sp_attn_config.get_dec_sink_size()
-        sink_block, local_block = self.model_config.sp_attn_config.get_dec_sink_block_num(), self.model_config.sp_attn_config.get_dec_local_block_num()
+        sink_size, local_size = (
+            self.model_config.sp_attn_config.get_dec_sink_size(),
+            self.model_config.sp_attn_config.get_dec_sink_size(),
+        )
+        sink_block, local_block = (
+            self.model_config.sp_attn_config.get_dec_sink_block_num(),
+            self.model_config.sp_attn_config.get_dec_local_block_num(),
+        )
         for seq_group_metadata in seq_group_metadata_list:
             assert seq_group_metadata.is_prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -287,15 +358,22 @@ class ModelRunner:
             retrieval_context_lens.append(context_len)
 
             if seq_group_metadata.retrieval_block_tables is not None:
-                retrieval_block_table = seq_group_metadata.retrieval_block_tables[seq_id]
+                retrieval_block_table = seq_group_metadata.retrieval_block_tables[
+                    seq_id
+                ]
                 retrieval_block_tables.append(retrieval_block_table)
-                
+
             if self.model_config.sp_attn_config.sparse_kv_cache_enabled():
                 streaming_context_lens.append(min(context_len, sink_size + local_size))
                 if seq_group_metadata.streaming_block_tables is not None:
-                    streaming_block_table = seq_group_metadata.streaming_block_tables[seq_id]
-                    if context_len > sink_size + local_size:   
-                        streaming_block_table = streaming_block_table[:sink_block] + streaming_block_table[-local_block:]
+                    streaming_block_table = seq_group_metadata.streaming_block_tables[
+                        seq_id
+                    ]
+                    if context_len > sink_size + local_size:
+                        streaming_block_table = (
+                            streaming_block_table[:sink_block]
+                            + streaming_block_table[-local_block:]
+                        )
                     streaming_block_tables.append(streaming_block_table)
 
         max_prompt_len = max(retrieval_context_lens)
@@ -305,43 +383,41 @@ class ModelRunner:
         retrieval_context_lens_tensor = torch.tensor(
             retrieval_context_lens, dtype=torch.int, device=self.device
         )
-        
+
         if self.model_config.sp_attn_config.sparse_kv_cache_enabled():
             streaming_context_lens_tensor = torch.tensor(
                 streaming_context_lens, dtype=torch.int, device=self.device
             )
         else:
             streaming_context_lens_tensor = None
-        
+
         cu_seqlens_tensor = torch.cumsum(retrieval_context_lens_tensor, dim=0).int()
         cu_seqlens_tensor = torch.nn.functional.pad(cu_seqlens_tensor, (1, 0), value=0)
         # Prepare prefix block tables
         (
-            retrieval_block_tables, 
-            streaming_block_tables, 
-            max_retrieval_block_table_len, 
-            max_streaming_block_table_len
+            retrieval_block_tables,
+            streaming_block_tables,
+            max_retrieval_block_table_len,
+            max_streaming_block_table_len,
         ) = pad_block_tables(
-            retrieval_block_tables=retrieval_block_tables,                
-            streaming_block_tables=streaming_block_tables, 
-            sparse_kv_cache_enabled=self.model_config.sp_attn_config.sparse_kv_cache_enabled(),
-            device="cpu",
-        )
-        
-        layers = self.num_layers
-        (
-            layer_retrieval_block_tables, 
-            layer_streaming_block_tables
-        ) = get_layer_block_tables(
-            cache_engine=self.cache_engine,
-            layers=layers,
-            cache_config=self.cache_config,
             retrieval_block_tables=retrieval_block_tables,
             streaming_block_tables=streaming_block_tables,
             sparse_kv_cache_enabled=self.model_config.sp_attn_config.sparse_kv_cache_enabled(),
-            device=self.device
+            device="cpu",
         )
-        
+
+        layers = self.num_layers
+        (layer_retrieval_block_tables, layer_streaming_block_tables) = (
+            get_layer_block_tables(
+                cache_engine=self.cache_engine,
+                layers=layers,
+                cache_config=self.cache_config,
+                retrieval_block_tables=retrieval_block_tables,
+                streaming_block_tables=streaming_block_tables,
+                sparse_kv_cache_enabled=self.model_config.sp_attn_config.sparse_kv_cache_enabled(),
+                device=self.device,
+            )
+        )
 
         padding_offsets_tensor = fused_attention.compute_padding_offsets(
             cu_seqlens_tensor, max_prompt_len, input_tokens.size(0)
@@ -376,8 +452,14 @@ class ModelRunner:
         retrieval_block_tables = []
         streaming_block_tables = []
         assert self.sliding_window is None
-        sink_size, local_size = self.model_config.sp_attn_config.get_dec_sink_size(), self.model_config.sp_attn_config.get_dec_sink_size()
-        sink_block, local_block = self.model_config.sp_attn_config.get_dec_sink_block_num(), self.model_config.sp_attn_config.get_dec_local_block_num()
+        sink_size, local_size = (
+            self.model_config.sp_attn_config.get_dec_sink_size(),
+            self.model_config.sp_attn_config.get_dec_sink_size(),
+        )
+        sink_block, local_block = (
+            self.model_config.sp_attn_config.get_dec_sink_block_num(),
+            self.model_config.sp_attn_config.get_dec_local_block_num(),
+        )
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -387,14 +469,23 @@ class ModelRunner:
                 input_tokens.append([generation_token])
                 context_len = seq_data.get_len()
                 retrieval_context_lens.append(context_len)
-                retrieval_block_table = seq_group_metadata.retrieval_block_tables[seq_id]
+                retrieval_block_table = seq_group_metadata.retrieval_block_tables[
+                    seq_id
+                ]
                 retrieval_block_tables.append(retrieval_block_table)
-                
+
                 if self.model_config.sp_attn_config.sparse_kv_cache_enabled():
-                    streaming_context_lens.append(min(context_len, sink_size + local_size))
-                    streaming_block_table = seq_group_metadata.streaming_block_tables[seq_id]
-                    if context_len > sink_size + local_size: 
-                        streaming_block_table = streaming_block_table[:sink_block] + streaming_block_table[-local_block:]
+                    streaming_context_lens.append(
+                        min(context_len, sink_size + local_size)
+                    )
+                    streaming_block_table = seq_group_metadata.streaming_block_tables[
+                        seq_id
+                    ]
+                    if context_len > sink_size + local_size:
+                        streaming_block_table = (
+                            streaming_block_table[:sink_block]
+                            + streaming_block_table[-local_block:]
+                        )
                     streaming_block_tables.append(streaming_block_table)
 
         max_context_len = max(retrieval_context_lens)
@@ -402,34 +493,37 @@ class ModelRunner:
         input_tokens = _make_tensor_with_pad(
             input_tokens, max_len=1, pad=0, dtype=torch.long, device=self.device
         ).squeeze(1)
-        retrieval_context_lens = torch.tensor(retrieval_context_lens, dtype=torch.int, device=self.device)
-        streaming_context_lens = torch.tensor(streaming_context_lens, dtype=torch.int, device=self.device)
-        
+        retrieval_context_lens = torch.tensor(
+            retrieval_context_lens, dtype=torch.int, device=self.device
+        )
+        streaming_context_lens = torch.tensor(
+            streaming_context_lens, dtype=torch.int, device=self.device
+        )
+
         (
-            retrieval_block_tables, 
-            streaming_block_tables, 
-            max_retrieval_block_table_len, 
-            max_streaming_block_table_len
+            retrieval_block_tables,
+            streaming_block_tables,
+            max_retrieval_block_table_len,
+            max_streaming_block_table_len,
         ) = pad_block_tables(
-            retrieval_block_tables=retrieval_block_tables,                
-            streaming_block_tables=streaming_block_tables, 
+            retrieval_block_tables=retrieval_block_tables,
+            streaming_block_tables=streaming_block_tables,
             sparse_kv_cache_enabled=self.model_config.sp_attn_config.sparse_kv_cache_enabled(),
             device=self.device,
         )
 
         layers = self.num_layers
 
-        (
-            layer_retrieval_block_tables, 
-            layer_streaming_block_tables
-        ) = get_layer_block_tables(
-            cache_engine=self.cache_engine,
-            layers=layers,
-            cache_config=self.cache_config,
-            retrieval_block_tables=retrieval_block_tables,
-            streaming_block_tables=streaming_block_tables,
-            sparse_kv_cache_enabled=self.model_config.sp_attn_config.sparse_kv_cache_enabled(),
-            device=self.device
+        (layer_retrieval_block_tables, layer_streaming_block_tables) = (
+            get_layer_block_tables(
+                cache_engine=self.cache_engine,
+                layers=layers,
+                cache_config=self.cache_config,
+                retrieval_block_tables=retrieval_block_tables,
+                streaming_block_tables=streaming_block_tables,
+                sparse_kv_cache_enabled=self.model_config.sp_attn_config.sparse_kv_cache_enabled(),
+                device=self.device,
+            )
         )
 
         input_metadata = InputMetadata(
@@ -480,23 +574,31 @@ class ModelRunner:
         seq_len = seq_group_metadata_list[0].seq_data[0].get_len()
         retrieval_context_len = seq_len
         retrieval_context_lens = torch.tensor(
-            [retrieval_context_len,] * len(seq_group_metadata_list),
+            [
+                retrieval_context_len,
+            ]
+            * len(seq_group_metadata_list),
             dtype=torch.int,
             device=self.device,
         )
         max_context_len = retrieval_context_len
-        
+
         if self.model_config.sp_attn_config.sparse_kv_cache_enabled():
-            sink_size, local_size = self.model_config.sp_attn_config.get_dec_sink_size(), self.model_config.sp_attn_config.get_dec_sink_size()
+            sink_size, local_size = (
+                self.model_config.sp_attn_config.get_dec_sink_size(),
+                self.model_config.sp_attn_config.get_dec_sink_size(),
+            )
             streaming_context_len = min(retrieval_context_len, sink_size + local_size)
             streaming_context_lens = torch.tensor(
-                [streaming_context_len,] * len(seq_group_metadata_list),
+                [
+                    streaming_context_len,
+                ]
+                * len(seq_group_metadata_list),
                 dtype=torch.int,
                 device=self.device,
             )
         else:
             streaming_context_lens = None
-        
 
         input_tokens = _make_tensor_with_pad(
             input_tokens, max_len=1, pad=0, dtype=torch.long, device=self.device
@@ -532,12 +634,14 @@ class ModelRunner:
     ) -> Tuple[torch.Tensor, InputMetadata]:
         # NOTE: We assume that all sequences in the group are all prompts or all decodes.
         is_prompt = seq_group_metadata_list[0].is_prompt
-        
+
         # NOTE: We assume that all sequences in the group share the same sampling_params.
         sampling_params = seq_group_metadata_list[0].sampling_params
 
         if len(sampling_params.decoding_sim_token_ids) > 0:
-            assert len(seq_group_metadata_list) == 1, "Only one sequence per-batch is allowed when activating decoding simulation."
+            assert len(seq_group_metadata_list) == 1, (
+                "Only one sequence per-batch is allowed when activating decoding simulation."
+            )
 
         # Prepare input tensors.
         if is_prompt:

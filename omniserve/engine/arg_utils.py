@@ -14,8 +14,8 @@ import argparse
 import dataclasses
 from dataclasses import dataclass
 from typing import Optional, Tuple
-import os
 import torch
+import yaml
 
 from omniserve.config import (
     CacheConfig,
@@ -23,6 +23,7 @@ from omniserve.config import (
     IFBConfig,
     ModelConfig,
     ParallelConfig,
+    PrecisionMap,
     SchedulerConfig,
 )
 
@@ -73,12 +74,13 @@ class EngineArgs:
     ifb_mode: bool = False
     benchmarking: bool = False
     precision: str = "w4a8kv4"
+    precision_map: Optional[str] = None
     # int4_kv: bool = False
     # kv_zp: bool = True
     quant_path: Optional[str] = None
     group_size: int = -1
     omit_prompt: bool = False
-    kv_quant_granularity: Optional[str] = None #str = "per_tensor"
+    kv_quant_granularity: Optional[str] = None  # str = "per_tensor"
     chunk_prefill_size: int = 32000
     sparse_context_mode: bool = False
     sparse_decode_mode: int = 1
@@ -258,7 +260,7 @@ class EngineArgs:
             "--max-num-batched-tokens",
             type=int,
             default=EngineArgs.max_num_batched_tokens,
-            help="maximum number of batched tokens per " "iteration",
+            help="maximum number of batched tokens per iteration",
         )
         parser.add_argument(
             "--max-num-seqs",
@@ -338,6 +340,13 @@ class EngineArgs:
             default="w4a8kv4",
             help="Model precision. Select from [w4a8kv4, w4a8kv8, w8a8kv4, w8a8kv8]. If kv precision is not specified, it will be the same as the activation.",
         )
+        parser.add_argument(
+            "--precision-map",
+            type=str,
+            default=None,
+            metavar="YAML",
+            help="Path to the precision map YAML file.",
+        )
         # parser.add_argument(
         #     "--int4-kv",
         #     action="store_true",
@@ -385,7 +394,7 @@ class EngineArgs:
             help="Directory to load static sparse attention alpha",
         )
         parser.add_argument(
-            "--static-sparsity", #todo: change this to static sparsity
+            "--static-sparsity",  # todo: change this to static sparsity
             type=float,
             default=EngineArgs.static_sparsity,
             help="Sparsity of the attention pattern.",
@@ -421,13 +430,13 @@ class EngineArgs:
         )
         # for decoding
         parser.add_argument(
-            "--sparse-decode-mode", #todo: use this to replace dynamic_sparse-mode
+            "--sparse-decode-mode",  # todo: use this to replace dynamic_sparse-mode
             type=int,
             default=EngineArgs.sparse_decode_mode,
             help="Mode for sparse decoding.",
         )
         parser.add_argument(
-            "--sub-chunk-per-block", #todo: use this to replace N_SUB_CHUNK_PER_BLOCK
+            "--sub-chunk-per-block",  # todo: use this to replace N_SUB_CHUNK_PER_BLOCK
             type=int,
             default=EngineArgs.sub_chunk_per_block,
             help="Number of logical pages in one physical page.",
@@ -450,7 +459,7 @@ class EngineArgs:
             default=EngineArgs.multiblock_switch,
             help="The sequence length at witch using multiblock.",
         )
-        
+
         return parser
 
     @classmethod
@@ -460,6 +469,15 @@ class EngineArgs:
         # Set the attributes from the parsed arguments.
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
         return engine_args
+
+    def parse_precision_map(self) -> PrecisionMap | None:
+        """Parse the precision map from the YAML file."""
+        if self.precision_map is None:
+            return None
+
+        with open(self.precision_map, "r") as f:
+            precision_map = yaml.safe_load(f)
+        return PrecisionMap(**precision_map)
 
     def create_engine_configs(
         self,
@@ -486,8 +504,10 @@ class EngineArgs:
             "w8a8kv4",
             "w8a8kv8",
             "w16a16kv8",
-            "w16a16kv4"
-        ], f"Invalid precision {self.precision} specified. Please choose from w4a8, w4a8kv4, w4a8kv8, w8a8, w8a8kv4, w8a8kv8, w16a16kv8, w16a16kv4."
+            "w16a16kv4",
+        ], (
+            f"Invalid precision {self.precision} specified. Please choose from w4a8, w4a8kv4, w4a8kv8, w8a8, w8a8kv4, w8a8kv8, w16a16kv8, w16a16kv4."
+        )
 
         if "kv4" in self.precision:
             self.kv_cache_bits = 4
@@ -496,15 +516,18 @@ class EngineArgs:
             self.kv_cache_bits = 8
             self.int4_kv = False
         precision = self.precision
+        precision_map = self.parse_precision_map()
         # self.kv_zp = True
         # Note (kentang): per-tensor kv8 does not have zero point.
-        
+
         if self.kv_quant_granularity == "per_tensor":
             self.kv_zp = False
         elif self.kv_quant_granularity == "fine_grained":
             self.kv_zp = True
         else:
-            raise NotImplementedError(f"Unsupported kv_quant_granularity {self.kv_quant_granularity}")
+            raise NotImplementedError(
+                f"Unsupported kv_quant_granularity {self.kv_quant_granularity}"
+            )
 
         kv_zp = self.kv_zp
         int4_kv = self.int4_kv
@@ -529,23 +552,25 @@ class EngineArgs:
             self.max_context_len_to_capture,
             self.kv_quant_granularity,
             self.chunk_prefill_size,
-            self.multiblock_switch
+            self.multiblock_switch,
+            precision,
+            precision_map,
         )
         sp_attn_config = sparse_attn_init(
-            total_num_kv_heads = model_config.get_total_num_kv_heads(),
-            total_num_layers = model_config.hf_config.num_hidden_layers,
-            cache_block_size = self.block_size,
-            sparse_context_mode = self.sparse_context_mode,
-            sparse_decode_mode = self.sparse_decode_mode,
-            static_sparse_attn_load_dir = self.static_sparse_attn_load_dir,
-            static_sparsity = self.static_sparsity,
-            ctx_sink_token = self.ctx_sink_token,
-            ctx_local_token = self.ctx_local_token,
-            dec_sink_token = self.dec_sink_token,
-            dec_local_token = self.dec_local_token,
-            sub_chunk_per_block = self.sub_chunk_per_block,
-            dynamic_sparse_token_budget = self.dynamic_sparse_token_budget,
-            selector_update_interval = self.selector_update_interval
+            total_num_kv_heads=model_config.get_total_num_kv_heads(),
+            total_num_layers=model_config.hf_config.num_hidden_layers,
+            cache_block_size=self.block_size,
+            sparse_context_mode=self.sparse_context_mode,
+            sparse_decode_mode=self.sparse_decode_mode,
+            static_sparse_attn_load_dir=self.static_sparse_attn_load_dir,
+            static_sparsity=self.static_sparsity,
+            ctx_sink_token=self.ctx_sink_token,
+            ctx_local_token=self.ctx_local_token,
+            dec_sink_token=self.dec_sink_token,
+            dec_local_token=self.dec_local_token,
+            sub_chunk_per_block=self.sub_chunk_per_block,
+            dynamic_sparse_token_budget=self.dynamic_sparse_token_budget,
+            selector_update_interval=self.selector_update_interval,
         )
         self.kv_cache_bits = _get_dtype_size(
             _STR_DTYPE_TO_TORCH_DTYPE[self.kv_cache_dtype]
@@ -562,11 +587,11 @@ class EngineArgs:
             self.kv_cache_bits,
             model_config.get_sliding_window(),
         )
-        
+
         # add sp_attn_config to cache_config and model_config
         model_config.sp_attn_config = sp_attn_config
         cache_config.sp_attn_config = sp_attn_config
-        
+
         parallel_config = ParallelConfig(
             self.pipeline_parallel_size,
             self.tensor_parallel_size,

@@ -69,7 +69,9 @@ max_seq_len = omniserve.utils.constants.max_seq_len
 def make_qlinear(
     name, in_dim, out_dim, *, bias, group_size, precision: str, prec_map: PrecisionMap
 ):
-    is_sensitive_layer = any(name in layer for layer in prec_map.sensitive_layers)
+    is_sensitive_layer = any(
+        f"model.layers.{name}" in layer for layer in prec_map.sensitive_layers
+    )
     if is_sensitive_layer:
         precision = prec_map.precision
 
@@ -255,7 +257,7 @@ class LlamaAttention(nn.Module):
             attention_bias = False
 
         self.qkv_proj = make_qlinear(
-            f"{layer_idx}.qkv_proj",
+            f"{layer_idx}.self_attn.qkv_proj",
             hidden_size,
             (self.total_num_heads + 2 * self.total_num_kv_heads * num_kv_heads_replicas)
             * self.head_dim,
@@ -266,7 +268,7 @@ class LlamaAttention(nn.Module):
         )
 
         self.o_proj = make_qlinear(
-            f"{layer_idx}.o_proj",
+            f"{layer_idx}.self_attn.o_proj",
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=attention_bias,

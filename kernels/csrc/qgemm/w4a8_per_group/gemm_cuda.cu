@@ -354,6 +354,11 @@ __global__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
   blockIdx_n = block_idx_mapping.x;
   blockIdx_m = block_idx_mapping.y;
 
+  if (blockIdx_n >= num_blocks_n || blockIdx_m >= num_blocks_m)
+  {
+    return;
+  }
+
   int C_warp[CTA_M * CTA_N / CTA_SIZE_MN];
   constexpr int kSmemPadKA = CTA_K + SMEM_PAD_A;
   constexpr int kSmemPadKB = CTA_K + SMEM_PAD_B;

@@ -81,10 +81,12 @@ def initialize_engine(args: argparse.Namespace) -> LLMEngine:
 def main(args: argparse.Namespace):
     """Main function that sets up and runs the prompt processing."""
 
-    batch_size = int(os.environ.get("GLOBAL_BATCH_SIZE"))
+    # Default to batch_size=1 if env var is not provided
+    batch_size = int(os.environ.get("GLOBAL_BATCH_SIZE", "1"))
     prompt_len = 1024
     generation_len = 512
-    rounds = 3
+    rounds = 3  # measured rounds
+    warmup_rounds = 1
 
     with open("results.csv", "a") as file:
         print("=" * 50, file=file)
@@ -94,13 +96,12 @@ def main(args: argparse.Namespace):
         )
 
     with torch.no_grad():
-        for rnd in range(rounds):
-            if rnd < rounds - 1:
-                print("[Warmup Round %d]" % rnd)
+        # Dedicated warmup runs (not recorded)
+        for w in range(warmup_rounds):
+            print(f"[Warmup Round {w}]")
             engine = initialize_engine(args)
             engine.profiling_mode = True
-            # warm up
-            time_lis, num_tokens = process_requests(
+            _ = process_requests(
                 engine,
                 batch_size=batch_size,
                 prompt_len=prompt_len,
@@ -110,13 +111,54 @@ def main(args: argparse.Namespace):
             torch.cuda.empty_cache()
             gc.collect()
 
-            throughput = num_tokens / sum(time_lis)
-            print(f"Round {rnd} Throughput:", throughput, "tokens / second.")
+        # Measured rounds
+        for rnd in range(rounds):
+            engine = initialize_engine(args)
+            engine.profiling_mode = True
+
+            # Reset CUDA peak memory stats across all visible devices
+            if torch.cuda.is_available():
+                for d in range(torch.cuda.device_count()):
+                    torch.cuda.reset_peak_memory_stats(d)
+
+            time_lis, num_tokens = process_requests(
+                engine,
+                batch_size=batch_size,
+                prompt_len=prompt_len,
+                generation_len=generation_len,
+            )
+
+            # Synchronize before reading memory stats
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            # Collect peak memory across devices
+            peak_alloc_bytes = 0
+            peak_reserved_bytes = 0
+            if torch.cuda.is_available():
+                for d in range(torch.cuda.device_count()):
+                    peak_alloc_bytes = max(peak_alloc_bytes, torch.cuda.max_memory_allocated(d))
+                    peak_reserved_bytes = max(peak_reserved_bytes, torch.cuda.max_memory_reserved(d))
+
+            del engine
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            throughput = num_tokens / max(1e-9, sum(time_lis))
+            peak_alloc_gb = peak_alloc_bytes / (1024 ** 3)
+            peak_reserved_gb = peak_reserved_bytes / (1024 ** 3)
+
+            print(
+                f"Round {rnd} Throughput: {throughput:.3f} tokens / second. | "
+                f"Peak Alloc: {peak_alloc_gb:.3f} GB | Peak Reserved: {peak_reserved_gb:.3f} GB"
+            )
             with open("results.csv", "a") as file:
                 print(
-                    f"Round {rnd} Throughput:",
-                    throughput,
-                    "tokens / second.",
+                    f"Round {rnd} Throughput: {throughput:.3f} tokens / second.",
+                    file=file,
+                )
+                print(
+                    f"Round {rnd} Peak Alloc: {peak_alloc_gb:.3f} GB | Peak Reserved: {peak_reserved_gb:.3f} GB",
                     file=file,
                 )
 

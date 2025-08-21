@@ -51,6 +51,9 @@ def process_requests(
     iter = 1
 
     time_lis = []
+    # Track TTFT per sequence id (time from start to first observed token)
+    first_token_seen = set()
+    ttft_list = []
     num_tokens = 0
     torch.cuda.synchronize()
     st = time.time()
@@ -63,13 +66,30 @@ def process_requests(
         if len(requests_outputs) == 0:
             break
 
+        # Record TTFT when we first see a seq id in outputs (only when outputs are dicts)
+        now = time.time()
+        if isinstance(requests_outputs, list) and requests_outputs:
+            if isinstance(requests_outputs[0], dict) and "id" in requests_outputs[0]:
+                for out in requests_outputs:
+                    sid = out.get("id")
+                    if sid is not None and sid not in first_token_seen:
+                        first_token_seen.add(sid)
+                        ttft_list.append(now - st)
+
         iter += 1
         if engine.profiling_mode and iter == generation_len + 1:
             break
     torch.cuda.synchronize()
     ed = time.time()
     time_lis.append(ed - st)
-    return time_lis, num_tokens
+    # Compute p95 of TTFT if we saw any tokens
+    ttft_p95 = None
+    if ttft_list:
+        ttft_list.sort()
+        # p95 index using nearest-rank method
+        k = max(1, int(0.95 * len(ttft_list) + 0.999999)) - 1
+        ttft_p95 = ttft_list[min(k, len(ttft_list) - 1)]
+    return time_lis, num_tokens, ttft_p95
 
 
 def initialize_engine(args: argparse.Namespace) -> LLMEngine:
@@ -121,7 +141,7 @@ def main(args: argparse.Namespace):
                 for d in range(torch.cuda.device_count()):
                     torch.cuda.reset_peak_memory_stats(d)
 
-            time_lis, num_tokens = process_requests(
+            time_lis, num_tokens, ttft_p95 = process_requests(
                 engine,
                 batch_size=batch_size,
                 prompt_len=prompt_len,
@@ -145,16 +165,27 @@ def main(args: argparse.Namespace):
             gc.collect()
 
             throughput = num_tokens / max(1e-9, sum(time_lis))
+            ttft_ms = (ttft_p95 * 1000.0) if ttft_p95 is not None else None
+            ttft_str = f"{ttft_ms:.1f} ms" if ttft_ms is not None else "N/A"
             peak_alloc_gb = peak_alloc_bytes / (1024 ** 3)
             peak_reserved_gb = peak_reserved_bytes / (1024 ** 3)
 
             print(
                 f"Round {rnd} Throughput: {throughput:.3f} tokens / second. | "
+                f"p95 TTFT: {ttft_str} | "
                 f"Peak Alloc: {peak_alloc_gb:.3f} GB | Peak Reserved: {peak_reserved_gb:.3f} GB"
             )
             with open("results.csv", "a") as file:
                 print(
                     f"Round {rnd} Throughput: {throughput:.3f} tokens / second.",
+                    file=file,
+                )
+                print(
+                    (
+                        f"Round {rnd} p95 TTFT: {ttft_ms:.1f} ms"
+                        if ttft_ms is not None
+                        else f"Round {rnd} p95 TTFT: N/A"
+                    ),
                     file=file,
                 )
                 print(

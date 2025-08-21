@@ -114,7 +114,7 @@ def main():
     parser.add_argument('--csv', required=True, help='CSV for config_gen.py')
     parser.add_argument('--batch-size', type=int, required=True)
     # Encoded defaults from benchmark.sh, but overridable
-    parser.add_argument('--model', default='./QServe-benchmarks/Llama-2-13B', help='Model path for qserve_benchmark.py')
+    parser.add_argument('--model', default='./QServe-benchmarks/Llama-2-7B', help='Model path for qserve_benchmark.py')
     parser.add_argument('--precision', default='w4a8kv8')
     parser.add_argument('--group-size', type=int, default=128)
     parser.add_argument('--kv-quant-granularity', default='fine_grained')

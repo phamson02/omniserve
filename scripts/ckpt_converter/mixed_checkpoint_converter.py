@@ -1,0 +1,235 @@
+import os
+import torch
+import argparse
+import yaml
+from omniserve.modeling.layers.quantized_linear import (
+    W4A8OF16LinearDynamicInputScale,
+    W8A8OF16LinearDynamicInputScale,
+)
+from quant_utils import get_blocks, get_named_linears, scale_activations, set_op_by_name
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, modeling_utils
+from tqdm import tqdm
+
+
+def skip(*args, **kwargs):
+    pass
+
+
+torch.nn.init.kaiming_uniform_ = skip
+torch.nn.init.kaiming_normal_ = skip
+torch.nn.init.uniform_ = skip
+torch.nn.init.normal_ = skip
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model-type", type=str, default="LLaMa", help="type of the model"
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="/data/llama-2-7b-hf/",
+        help="path to the hf model configs",
+    )
+    parser.add_argument(
+        "--quant-path",
+        type=str,
+        default="/data/llama-2-7b-hf-fake-quant/",
+        help="path to the fake quantized model dumped by LMQuant, including model.pt and scale.pt",
+    )
+    parser.add_argument(
+        "--w-bit",
+        type=int,
+        default=4,
+        help="bitwidth for weight quantization",
+    )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=-1,
+        help="group size for quantization, -1 means per-channel quant",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default="../../qserve_checkpoints/",
+        help="path to save the real quantized model checkpoint",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+    )
+    parser.add_argument(
+        "--kv-per-tensor",
+        action="store_true",
+        help="save the KV scaling factors in the model checkpoint",
+    )
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help="path to YAML config file specifying layers to keep at 8-bit",
+    )
+
+    args = parser.parse_args()
+    # load sensitive layers from config if provided
+    if args.config_file:
+        cfg = yaml.safe_load(open(args.config_file, "r"))
+        raw_layers = cfg.get("sensitive_layers", [])
+        sensitive_layers = []
+        for layer in raw_layers:
+            # split qkv into q, k, v
+            if layer.endswith(".self_attn.qkv_proj"):
+                base = layer[: -len("qkv_proj")]
+                sensitive_layers.extend(
+                    [base + "q_proj", base + "k_proj", base + "v_proj"]
+                )
+            # split gate_up into gate and up projections
+            elif layer.endswith(".mlp.gate_up_proj"):
+                base = layer[: -len("gate_up_proj")]
+                sensitive_layers.extend([base + "gate_proj", base + "up_proj"])
+            else:
+                sensitive_layers.append(layer)
+    else:
+        sensitive_layers = []
+
+    assert args.model_type.lower() in [
+        "llama",
+    ], "We only support llama architecture for now."
+
+    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, use_fast=False, trust_remote_code=True
+    )
+
+    modeling_utils._init_weights = False
+    model = AutoModelForCausalLM.from_config(config)
+
+    fake_quant_ckpt = torch.load(
+        args.quant_path + "/model.pt", map_location=args.device
+    )
+    quant_params = torch.load(args.quant_path + "/scale.pt", map_location=args.device)
+    calib_acts = None  # ensure variable is defined
+    if args.kv_per_tensor:
+        calib_acts = torch.load(args.quant_path + "/acts.pt", map_location=args.device)
+
+    w_bit = args.w_bit
+    q_config = {"zero_point": True, "q_group_size": args.group_size}
+    if w_bit == 8:
+        assert args.group_size == -1, (
+            "Group size should be -1 (per-channel) for W8 quantization"
+        )
+
+    layers = get_blocks(model)
+    for i in tqdm(
+        range(len(layers)),
+    ):
+        layer = layers[i]
+        named_linears = get_named_linears(layer)
+        scale_activations(layer)
+
+        for name, module in named_linears.items():
+            layer_weight_name = f"model.layers.{i}.{name}"
+            # determine bitwidth: override to 8 if in sensitive_layers
+            local_w_bit = 8 if layer_weight_name in sensitive_layers else args.w_bit
+            s1_scale = quant_params[f"{layer_weight_name}.weight.scale.0"]
+            if q_config["q_group_size"] != -1:
+                assert f"{layer_weight_name}.weight.scale.1" in quant_params.keys(), (
+                    f"{layer_weight_name}.weight.scale.1 not found in quant_params. Please check if you are using per-group quantization."
+                )
+                s2_scale = quant_params[f"{layer_weight_name}.weight.scale.1"]
+            else:
+                assert (
+                    f"{layer_weight_name}.weight.scale.1" not in quant_params.keys()
+                ), (
+                    f"{layer_weight_name}.weight.scale.1 found in quant_params. Please check if you are using per-channel quantization."
+                )
+                s2_scale = None
+            zeros = quant_params[f"{layer_weight_name}.weight.zero"].to(torch.int8)
+            if zeros.min() < 0:
+                zeros = zeros + 8
+            module.weight.data = fake_quant_ckpt[f"{layer_weight_name}.weight"]
+            module = module.cpu()
+
+            if local_w_bit == 4:
+                q_linear = W4A8OF16LinearDynamicInputScale.from_linear(
+                    module,
+                    local_w_bit,
+                    q_config["q_group_size"],
+                    init_only=False,
+                    s1_scale=s1_scale,
+                    s2_scale=s2_scale,
+                    zeros=zeros,
+                )
+            else:
+                q_linear = W8A8OF16LinearDynamicInputScale.from_linear(
+                    module, local_w_bit, init_only=False, s1_scale=s1_scale
+                )
+            # q_linear.to(next(layer.parameters()).device)
+            set_op_by_name(layer, name, q_linear)
+
+    # Sync layers other than gemm layers
+    for key, param in model.named_parameters():
+        if "_proj" in key:
+            pass
+        else:
+            param.data = fake_quant_ckpt[key].data
+
+    model_state_dict = model.state_dict()
+
+    # print(calib_acts)
+    # exit()
+    # Add KV scaling factors to the model ckpt.
+    if args.kv_per_tensor:
+        assert calib_acts is not None, (
+            "calib_acts must be loaded when --kv-per-tensor is set"
+        )
+        for key, param in model.named_parameters():
+            if (
+                "post_attention_layernorm.weight" in key
+            ):  # Each layer has one post_attention_layernorm
+                kv_scale_key = key.replace(
+                    "post_attention_layernorm.weight", "self_attn.kv_scale_quant_orig"
+                )
+                k_rd_key = key.replace(
+                    "post_attention_layernorm.weight", "self_attn.k_rotary_emb.output"
+                )
+                v_rd_key = key.replace(
+                    "post_attention_layernorm.weight", "self_attn.v_proj.output"
+                )
+
+                try:  # lmquant v0.0.0 format
+                    k_max = calib_acts[k_rd_key]["dynamic_range.0.max"].item()
+                    v_max = calib_acts[v_rd_key]["dynamic_range.0.max"].item()
+                except Exception:  # deep compressor format
+                    k_max = calib_acts[k_rd_key]["dynamic_range"][0]["max"].item()
+                    v_max = calib_acts[v_rd_key]["dynamic_range"][0]["max"].item()
+
+                k_scale_quant_orig = k_max / 127.0
+                v_scale_quant_orig = v_max / 127.0
+
+                model_state_dict[kv_scale_key] = torch.tensor(
+                    [k_scale_quant_orig, v_scale_quant_orig]
+                ).to(param.device)  # Add dummy kv scaling factors
+
+    torch.save(model_state_dict, f"{args.output_path}/quant_model.pt")
+
+    # Organize checkpoint and config files
+    model_name = args.model_path.rstrip("/").split("/")[-1]
+    model_name = (
+        model_name + f"-w{args.w_bit}a8-per-channel"
+        if args.group_size == -1
+        else model_name + f"-w{args.w_bit}a8-g{args.group_size}"
+    ) + "-mixed"
+    model_name = model_name + "-kv-per-tensor" if args.kv_per_tensor else model_name
+    os.system(f"mkdir -p {args.output_path}")
+    os.system(f"mkdir -p {args.output_path}/{model_name}")
+    os.system(
+        f"mv {args.output_path}/quant_model.pt {args.output_path}/{model_name}/pytorch_model.bin"
+    )
+    os.system(f"scp {args.model_path}/*.json {args.output_path}/{model_name}")
+    os.system(f"scp {args.model_path}/tokenizer.model {args.output_path}/{model_name}")
+    os.system(f"rm -f {args.output_path}/{model_name}/pytorch_model.bin.index.json")
